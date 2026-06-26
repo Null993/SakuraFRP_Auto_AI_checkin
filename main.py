@@ -19,7 +19,8 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ========= 配置 =========
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.getenv("APP_DATA_DIR", Path(__file__).resolve().parent)).resolve()
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 domain = "www.natfrp.com"
 target_url = f"https://{domain}/user/"
 

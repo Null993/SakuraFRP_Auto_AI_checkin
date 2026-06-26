@@ -2,11 +2,16 @@ import base64
 import json
 import re
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from zhipuai import ZhipuAI
 
 # 加载环境变量
-load_dotenv()
+APP_DATA_DIR = os.getenv("APP_DATA_DIR")
+if APP_DATA_DIR:
+    load_dotenv(Path(APP_DATA_DIR) / ".env")
+else:
+    load_dotenv()
 
 class AIService:
     """AI服务类，封装所有AI调用逻辑"""
