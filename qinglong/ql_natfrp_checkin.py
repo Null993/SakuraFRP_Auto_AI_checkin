@@ -60,6 +60,24 @@ ALREADY_SIGNED_TEXT = "今天已经签到过啦"
 QL_DATA_DIR = Path(os.getenv("QL_DATA_DIR", "/ql/data"))
 STATE_FILE = QL_DATA_DIR / "scripts" / "natfrp_state.json"
 
+def get_int_env(name, default, min_value=None):
+    """读取整数环境变量，配置异常时回退到默认值。"""
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        print(f"[WARNING] {name}={raw_value!r} 不是有效整数，使用默认值 {default}")
+        return default
+    if min_value is not None and value < min_value:
+        print(f"[WARNING] {name}={value} 小于最小值 {min_value}，使用默认值 {default}")
+        return default
+    return value
+
+CHECKIN_MAX_ATTEMPTS = get_int_env("NATFRP_CHECKIN_MAX_ATTEMPTS", 3, 1)
+CHECKIN_RETRY_INTERVAL = get_int_env("NATFRP_CHECKIN_RETRY_INTERVAL", 60, 0)
+
 # ========= 青龙通知 =========
 def _load_qinglong_notify_send():
     """加载青龙内置 notify.py 的 send 函数。"""
@@ -521,6 +539,155 @@ def find_signed_text_locator(page, timeout=3000):
         pass
     return None
 
+def handle_age_confirm_popup(page):
+    """处理18岁确认弹窗。"""
+    try:
+        btn_18 = page.get_by_text("是，我已满18岁")
+        if btn_18.is_visible(timeout=3000): 
+            print("[DEBUG] 检测到18岁确认弹窗，正在点击...")
+            btn_18.click()
+            time.sleep(1)
+    except:
+        pass
+
+def ensure_logged_in(page, context, username, password):
+    """检测登录状态，必要时重新登录并更新缓存。"""
+    current_url = page.url
+    
+    try:
+        username_input_visible = page.locator("#username").is_visible(timeout=2000)
+    except:
+        username_input_visible = False
+    
+    if "login" not in current_url and not username_input_visible:
+        print("[INFO] 已登录状态（使用缓存）")
+        return True
+
+    print("[INFO] 检测到需要登录")
+    
+    try:
+        print("[INFO] 正在填写登录信息...")
+        page.fill("#username", username)
+        page.fill("#password", password)
+        page.click("#login")
+        
+        print("[DEBUG] 等待登录完成...")
+        page.wait_for_selector("text=账号信息", timeout=10000)
+        
+        # 保存登录状态
+        try:
+            context.storage_state(path=str(STATE_FILE))
+            print(f"[SUCCESS] 登录成功，状态已保存到: {STATE_FILE}")
+        except Exception as e:
+            print(f"[WARNING] 保存登录状态失败: {e}")
+            print("[SUCCESS] 登录成功")
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] 登录失败: {e}")
+        return False
+
+def perform_checkin_once(page, ai_service):
+    """执行单次签到尝试。"""
+    print("[DEBUG] 开始检查签到状态...")
+    
+    signed_locator = find_signed_text_locator(page)
+    if signed_locator:
+        print("[SUCCESS] 今日已签到")
+        return build_result("成功", "今日已签到，无需重复签到")
+
+    print("[DEBUG] 未检测到已签到状态，查找签到按钮...")
+    
+    sign_btn = page.get_by_text("点击这里签到")
+    try:
+        sign_btn_visible = sign_btn.is_visible(timeout=3000)
+    except:
+        sign_btn_visible = False
+    
+    if not sign_btn_visible:
+        print("[ERROR] 未找到签到按钮")
+        return build_result("失败", "未找到签到按钮")
+
+    print("[INFO] 点击签到按钮...")
+    sign_success = False
+    
+    try:
+        sign_btn.click()
+        print("[DEBUG] 已点击签到按钮，等待验证码加载...")
+        
+        # 等待15秒让验证码加载
+        print("[INFO] 等待15秒让验证码完全加载...")
+        for i in range(30):
+            time.sleep(0.5)
+            
+            if (i + 1) % 10 == 0:
+                print(f"[DEBUG] 已等待 {(i+1)*0.5:.1f} 秒...")
+            
+            signed_check = find_signed_text_locator(page, timeout=500)
+            if signed_check:
+                print("[SUCCESS] 签到完成（无需验证码）！")
+                sign_success = True
+                break
+        
+        if not sign_success:
+            # 检查验证码
+            captcha_type = detect_captcha_type(page)
+            
+            if captcha_type != "unknown":
+                print(f"[INFO] 检测到验证码类型: {captcha_type}")
+                
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    print(f"[DEBUG] 第 {attempt}/{max_attempts} 次尝试处理验证码...")
+                    
+                    try:
+                        if captcha_type == "grid":
+                            captcha_result = solve_geetest_multistep(page, ai_service)
+                        elif captcha_type == "slider":
+                            captcha_result = solve_geetest_slider(page, ai_service)
+                        else:
+                            captcha_result = False
+                        
+                        if captcha_result:
+                            print("[INFO] 验证码处理成功")
+                            time.sleep(3)
+                            
+                            # 检查是否签到成功
+                            signed_check = find_signed_text_locator(page, timeout=2000)
+                            if signed_check:
+                                print("[SUCCESS] 签到完成！")
+                                sign_success = True
+                                break
+                        else:
+                            print("[WARNING] 验证码处理失败，重试...")
+                            time.sleep(2)
+                            
+                            # 重新检测验证码类型
+                            captcha_type = detect_captcha_type(page)
+                            if captcha_type == "unknown":
+                                print("[DEBUG] 验证码已消失，检查签到状态...")
+                                signed_check = find_signed_text_locator(page, timeout=2000)
+                                if signed_check:
+                                    print("[SUCCESS] 签到完成！")
+                                    sign_success = True
+                                    break
+                    
+                    except Exception as e:
+                        print(f"[ERROR] 验证码处理异常: {e}")
+                        traceback.print_exc()
+            else:
+                print("[WARNING] 未检测到验证码")
+        
+        if not sign_success:
+            print("[ERROR] 签到失败：超时或验证码处理失败")
+            return build_result("失败", "签到失败：超时或验证码处理失败")
+        return build_result("成功", "签到完成")
+    
+    except Exception as e:
+        print(f"[ERROR] 签到过程出错: {e}")
+        traceback.print_exc()
+        return build_result("失败", "签到过程出错", [str(e)])
+
 def main():
     """主函数"""
     print("=" * 60)
@@ -583,154 +750,39 @@ def main():
             browser.close()
             return build_result("失败", "页面访问失败", [str(e), target_url])
         
-        # 登录判断
-        current_url = page.url
-        is_logged_in = True
+        if not ensure_logged_in(page, context, username, password):
+            browser.close()
+            return build_result("失败", "登录失败")
         
-        try:
-            username_input_visible = page.locator("#username").is_visible(timeout=2000)
-        except:
-            username_input_visible = False
+        handle_age_confirm_popup(page)
         
-        if "login" in current_url or username_input_visible:
-            is_logged_in = False
-            print("[INFO] 检测到需要登录")
-            
-            try:
-                print("[INFO] 正在填写登录信息...")
-                page.fill("#username", username)
-                page.fill("#password", password)
-                page.click("#login")
-                
-                print("[DEBUG] 等待登录完成...")
-                page.wait_for_selector("text=账号信息", timeout=10000)
-                
-                # 保存登录状态
+        # 签到失败时重试，避免页面偶发未加载出签到按钮导致当天漏签
+        attempt_results = []
+        for attempt in range(1, CHECKIN_MAX_ATTEMPTS + 1):
+            print(f"[INFO] 开始第 {attempt}/{CHECKIN_MAX_ATTEMPTS} 次签到尝试")
+            result = perform_checkin_once(page, ai_service)
+            attempt_results.append(f"第 {attempt} 次：{result.get('message', '')}")
+
+            if result.get("status") == "成功":
+                break
+
+            if attempt < CHECKIN_MAX_ATTEMPTS:
+                print(f"[WARNING] 签到尝试失败：{result.get('message', '')}")
+                print(f"[INFO] {CHECKIN_RETRY_INTERVAL} 秒后刷新页面并重试...")
+                if CHECKIN_RETRY_INTERVAL > 0:
+                    time.sleep(CHECKIN_RETRY_INTERVAL)
                 try:
-                    context.storage_state(path=str(STATE_FILE))
-                    print(f"[SUCCESS] 登录成功，状态已保存到: {STATE_FILE}")
+                    page.goto(target_url, timeout=30000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    if not ensure_logged_in(page, context, username, password):
+                        result = build_result("失败", "重试前重新登录失败")
+                        break
+                    handle_age_confirm_popup(page)
                 except Exception as e:
-                    print(f"[WARNING] 保存登录状态失败: {e}")
-                    print("[SUCCESS] 登录成功")
-                
-                is_logged_in = True
-            except Exception as e:
-                print(f"[ERROR] 登录失败: {e}")
-                browser.close()
-                return build_result("失败", "登录失败", [str(e)])
-        else:
-            print("[INFO] 已登录状态（使用缓存）")
-        
-        # 处理18岁弹窗
-        try:
-            btn_18 = page.get_by_text("是，我已满18岁")
-            if btn_18.is_visible(timeout=3000): 
-                print("[DEBUG] 检测到18岁确认弹窗，正在点击...")
-                btn_18.click()
-                time.sleep(1)
-        except:
-            pass
-        
-        # 签到
-        print("[DEBUG] 开始检查签到状态...")
-        
-        signed_locator = find_signed_text_locator(page)
-        if signed_locator:
-            print("[SUCCESS] 今日已签到")
-            result = build_result("成功", "今日已签到，无需重复签到")
-        else:
-            print("[DEBUG] 未检测到已签到状态，查找签到按钮...")
-            
-            sign_btn = page.get_by_text("点击这里签到")
-            try:
-                sign_btn_visible = sign_btn.is_visible(timeout=3000)
-            except:
-                sign_btn_visible = False
-            
-            if sign_btn_visible:
-                print("[INFO] 点击签到按钮...")
-                sign_success = False
-                
-                try:
-                    sign_btn.click()
-                    print("[DEBUG] 已点击签到按钮，等待验证码加载...")
-                    
-                    # 等待15秒让验证码加载
-                    print("[INFO] 等待15秒让验证码完全加载...")
-                    for i in range(30):
-                        time.sleep(0.5)
-                        
-                        if (i + 1) % 10 == 0:
-                            print(f"[DEBUG] 已等待 {(i+1)*0.5:.1f} 秒...")
-                        
-                        signed_check = find_signed_text_locator(page, timeout=500)
-                        if signed_check:
-                            print(f"[SUCCESS] 签到完成（无需验证码）！")
-                            sign_success = True
-                            break
-                    
-                    if not sign_success:
-                        # 检查验证码
-                        captcha_type = detect_captcha_type(page)
-                        
-                        if captcha_type != "unknown":
-                            print(f"[INFO] 检测到验证码类型: {captcha_type}")
-                            
-                            max_attempts = 3
-                            for attempt in range(1, max_attempts + 1):
-                                print(f"[DEBUG] 第 {attempt}/{max_attempts} 次尝试处理验证码...")
-                                
-                                try:
-                                    if captcha_type == "grid":
-                                        captcha_result = solve_geetest_multistep(page, ai_service)
-                                    elif captcha_type == "slider":
-                                        captcha_result = solve_geetest_slider(page, ai_service)
-                                    else:
-                                        captcha_result = False
-                                    
-                                    if captcha_result:
-                                        print("[INFO] 验证码处理成功")
-                                        time.sleep(3)
-                                        
-                                        # 检查是否签到成功
-                                        signed_check = find_signed_text_locator(page, timeout=2000)
-                                        if signed_check:
-                                            print("[SUCCESS] 签到完成！")
-                                            sign_success = True
-                                            break
-                                    else:
-                                        print("[WARNING] 验证码处理失败，重试...")
-                                        time.sleep(2)
-                                        
-                                        # 重新检测验证码类型
-                                        captcha_type = detect_captcha_type(page)
-                                        if captcha_type == "unknown":
-                                            print("[DEBUG] 验证码已消失，检查签到状态...")
-                                            signed_check = find_signed_text_locator(page, timeout=2000)
-                                            if signed_check:
-                                                print("[SUCCESS] 签到完成！")
-                                                sign_success = True
-                                                break
-                                
-                                except Exception as e:
-                                    print(f"[ERROR] 验证码处理异常: {e}")
-                                    traceback.print_exc()
-                        else:
-                            print("[WARNING] 未检测到验证码")
-                    
-                    if not sign_success:
-                        print("[ERROR] 签到失败：超时或验证码处理失败")
-                        result = build_result("失败", "签到失败：超时或验证码处理失败")
-                    else:
-                        result = build_result("成功", "签到完成")
-                
-                except Exception as e:
-                    print(f"[ERROR] 签到过程出错: {e}")
-                    traceback.print_exc()
-                    result = build_result("失败", "签到过程出错", [str(e)])
-            else:
-                print("[ERROR] 未找到签到按钮")
-                result = build_result("失败", "未找到签到按钮")
+                    print(f"[WARNING] 重试前刷新页面失败: {e}")
+
+        if result.get("status") != "成功" and attempt_results:
+            result["details"] = (result.get("details") or []) + attempt_results
         
         print("[INFO] 脚本运行结束")
         print("=" * 60)
